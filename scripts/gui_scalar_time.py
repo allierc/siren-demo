@@ -621,7 +621,7 @@ async function poll(){
   document.getElementById("prog").style.width=
     (r.steps ? (r.step/r.steps*100) : 0)+"%";
   const m=r.metrics||{};
-  if(m.n_parameters!==undefined){
+  if(m.n_parameters!==undefined && m.n_table!==undefined){
     PARAMS=` <span class="dim">&middot;</span> <span style="color:#fff">`
       +`${m.n_parameters.toLocaleString()} parameters, `
       +`${m.n_table.toLocaleString()} in the first layer, `

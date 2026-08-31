@@ -29,6 +29,7 @@ PAGES = [
     ("scripts/gui_field.py", 8941, [("/", True, True)]),
     ("scripts/gui_image.py", 8942, [("/", True, True), ("/decompose", False, False)]),
     ("scripts/gui_time.py", 8943, [("/", True, True)]),
+    ("scripts/gui_scalar_time.py", 8944, [("/", False, True)]),
 ]
 
 # A realistic /api/state payload. The empty state exercises none of the drawing

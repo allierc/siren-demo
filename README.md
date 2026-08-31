@@ -53,6 +53,7 @@ Ports are ngp-demo's + 100, so both repos can run at once.
 python scripts/gui_image.py     # http://localhost:8122  -- fit the painting
 python scripts/gui_field.py     # http://localhost:8121  -- recover a known warp
 python scripts/gui_time.py      # http://localhost:8124  -- a warp that moves
+python scripts/gui_scalar_time.py  # http://localhost:8125  -- a scalar field from a zarr
 ```
 
 `gui_image.py` fits the painting and shows the frequency ladder the first layer is
@@ -62,6 +63,17 @@ montage of what each band adds. **decompose** opens the montage full size.
 `gui_field.py` runs the registration benchmark, a SIREN against a dense control grid,
 scoring the field rather than the pixels. `gui_time.py` puts a slip band in motion
 and fits one `(x, y, t)` SIREN to the whole run.
+
+`gui_scalar_time.py` fits `f(x, y, t)` from a zarr -- the toy2d stores in
+`Plexus/prototype/graphcast`, a coarse slow wave and a fast Kuramoto on four
+discs, generated as three runs the page discovers from their own `summary.json`.
+The two halves are two decades apart in space (0% of the coarse field's energy
+above 32 cycles, 73.6% of the fine field's) and an order of magnitude apart in
+time (lag-1 autocorrelation 0.998 against 0.829), and a SIREN has one omega_0
+for all of it, x, y and t alike. Measured on the sum at 512x512, 300 steps: the
+SIREN reaches **24.33 dB with 198,657 parameters** against the hash grid's
+**26.04 dB with 5,270,331** -- 1.7 dB behind on 3.8% of the parameters. Viridis,
+on a fixed symmetric scale.
 
 ## omega_0 is the knob, and it fights the learning rate
 
