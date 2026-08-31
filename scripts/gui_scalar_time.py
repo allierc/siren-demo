@@ -57,7 +57,20 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # once while this was written.  Each store carries a summary.json saying which
 # part it holds, which is what the dataset toggle is built from rather than the
 # directory name.
-ZARR_GLOB = "/workspace/Plexus/prototype/graphcast/log/toy2d*/field.zarr"
+ZARR_GLOB = "/workspace/Plexus/prototype/graphcast/log/*/field.zarr"
+
+
+def _grid_rank(store):
+    """Length of the first grid array's shape, from metadata alone -- no read."""
+    for k in ("u", "v"):
+        meta = os.path.join(store, k, "grid", ".zarray")
+        if os.path.exists(meta):
+            try:
+                with open(meta) as f:
+                    return len(json.load(f)["shape"])
+            except (OSError, ValueError, KeyError):
+                return None
+    return None
 
 
 def datasets(pattern=None):
@@ -70,10 +83,20 @@ def datasets(pattern=None):
     out = {}
     for d in sorted(glob.glob(pattern or ZARR_GLOB), key=os.path.getmtime):
         part, name = None, os.path.basename(os.path.dirname(d))
+        # A store being written right now has a directory and no .zgroup yet.
+        # Skipping it beats crashing on it: the generator is often running.
+        if not os.path.exists(os.path.join(d, ".zgroup")):
+            continue
+        # And this page is f(x, y, t).  The same generator writes toy3d runs
+        # whose grids are (T, 1, Z, Y, X); they are not this page's problem, and
+        # picking one up silently would put a 3D volume behind a 2D selector.
+        rank = _grid_rank(d)
+        if rank is not None and rank != 4:
+            continue
         try:
             with open(os.path.join(os.path.dirname(d), "summary.json")) as f:
                 part = json.load(f).get("part")
-        except OSError:
+        except (OSError, ValueError):
             pass
         if part is None:                       # no summary: fall back on the name
             part = ("coarse" if "coarse" in name else
@@ -104,9 +127,10 @@ def load_field(which, down, device, stores=None):
 
     The dataset toggle picks the STORE, and each store defines its own field:
     `coarse` is u alone, `fine` is v alone, and `sum` is the run holding both,
-    with u carried up to v's grid and added.  Bilinear, not nearest, for the
-    upsampling: u has 0.0% of its energy above 32 cycles on a 256 grid, so
-    carrying it to 1024 invents nothing.
+    with u carried up to v's grid and added.  NEAREST, not bilinear: the coarse
+    field is discrete at 256^2 and smoothing it on the way up would hand the fit
+    a target with structure the PDE never produced.  One coarse cell is a 4x4
+    block of fine cells, which is what the generator now writes as well.
     """
     stores = stores or DATASETS
     path = stores.get(which)
@@ -133,8 +157,8 @@ def load_field(which, down, device, stores=None):
         a = grid("v")
     else:
         v = grid("v")
-        u = F.interpolate(grid("u")[:, None], size=v.shape[-2:], mode="bilinear",
-                          align_corners=False)[:, 0]
+        u = F.interpolate(grid("u")[:, None], size=v.shape[-2:],
+                          mode="nearest")[:, 0]
         a = u + v
     if down > 1:
         a = F.avg_pool2d(a[:, None], down)[:, 0]
@@ -693,6 +717,11 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 JOB["running"] = True
                 JOB["stamp"] += 1
+            # Rescan: the store may have appeared, moved or been regenerated
+            # since the page was opened.
+            found = datasets(ZARR_GLOB)
+            DATASETS.clear()
+            DATASETS.update(found)
             p = dict(DEFAULTS)
             for k, v in q.items():
                 p[k] = float(v) if _isnum(v) else v
@@ -731,8 +760,17 @@ def main():
     globals()["ZARR_GLOB"] = a.zarr_glob
     DATASETS.clear()
     DATASETS.update(datasets(a.zarr_glob))
+    # NOT a hard exit when nothing is found. The generator rewrites this tree
+    # while it runs -- the directory this page was written against was renamed
+    # twice in one afternoon -- so the page comes up either way and rescans on
+    # every run, and pressing run once the store lands is enough.
     if not DATASETS:
-        sys.exit(f"no field.zarr found under {a.zarr_glob}")
+        near = sorted(os.path.basename(os.path.dirname(d))
+                      for d in glob.glob(os.path.dirname(
+                          os.path.dirname(a.zarr_glob)) + "/*"))
+        print(f"no store under {a.zarr_glob} yet -- the page will rescan on "
+              f"every run. Beside it: {', '.join(near[:8]) or 'nothing'}",
+              flush=True)
     DEFAULTS["field"] = "sum" if "sum" in DATASETS else sorted(DATASETS)[0]
     Handler.device = torch.device(a.device)
     try:
