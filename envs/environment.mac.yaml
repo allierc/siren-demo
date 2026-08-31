@@ -1,0 +1,37 @@
+name: ngp-demo-mac
+channels:
+  - pytorch
+  - conda-forge
+
+dependencies:
+  # Core
+  - python=3.12
+  - pip=26.0.1
+
+  # Keep the BLAS/OpenMP stack consistent on macOS (no Accelerate pin)
+  - "libblas=*=*openblas*"
+
+  # Everything this repo actually imports
+  - numpy=2.3.3
+  - matplotlib=3.10.8
+  - pillow=11.3.0
+  - pyyaml=6.0.3
+  - imageio=2.37.0
+
+  - pytest=8.4.2
+
+  # PyTorch from conda on macOS, so a single OpenMP runtime is managed by conda.
+  # There is no CUDA here: the demos run on Metal (device mps) or on the CPU,
+  # and every timing in the README was measured on an A6000, so expect them to
+  # be slower rather than comparable.
+  - pytorch=2.7.1
+
+  - pip:
+      # Not the ffmpeg binary -- the Python package. imageio's mp4 writer falls
+      # back silently without it and produces a TIFF carrying an .mp4 name.
+      - imageio-ffmpeg==0.5.1
+      # zapbench only: scripts/zapbench_view.py and zapbench_modes.py read
+      # gs://zapbench-release through it. 0.1.65 is the version the flow-field
+      # numbers in the README were measured with. Nothing else imports it, so
+      # dropping this line still gives a working environment for every stage.
+      - tensorstore==0.1.65

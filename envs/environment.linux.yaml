@@ -1,0 +1,38 @@
+name: ngp-demo
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  # Core
+  - python=3.12.7
+  - pip=24.3.1
+
+  # OpenBLAS / LLVM-OpenMP, so conda and pip do not each bring their own OpenMP
+  - "libblas=*=*openblas*"
+  - "liblapack=*=*openblas*"
+  - llvm-openmp=19.1.0
+
+  # Everything this repo actually imports
+  - numpy=2.3.3
+  - matplotlib=3.10.0
+  - pillow=11.0.0
+  - pyyaml=6.0.2
+  - imageio=2.36.1
+
+  # Optional: the test suite runs standalone, pytest is a convenience
+  - pytest=8.3.4
+
+  - pip:
+      # CUDA 12.8 wheels: the version every number in the README was measured on
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - torch==2.9.0
+
+      # imageio writes mp4 through this; without the PACKAGE (not merely ffmpeg
+      # on PATH) the writer degrades silently and emits a TIFF with an .mp4 name
+      - imageio-ffmpeg==0.5.1
+      # zapbench only: scripts/zapbench_view.py and zapbench_modes.py read
+      # gs://zapbench-release through it. 0.1.65 is the version the flow-field
+      # numbers in the README were measured with. Nothing else imports it, so
+      # dropping this line still gives a working environment for every stage.
+      - tensorstore==0.1.65

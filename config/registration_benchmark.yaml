@@ -1,0 +1,187 @@
+name: vermeer_registration_benchmark
+seed: 0
+device: cuda
+
+image:
+  path: assets/girl_with_a_pearl_earring.jpg
+  channels: gray
+  downsample: 2
+  foreground:
+    threshold: 0.14
+    blur_px: 3
+    open_px: 6
+    dilate_px: 12
+    zero_background: true
+    feather_px: 9
+
+warp:
+  convention: target(x) = source(x + u(x))
+  resample: bilinear
+  padding: border
+  units: pixels
+
+deformations:
+  - name: global_smooth
+    type: fourier
+    n_modes: 3
+    k_max: 2
+    max_displacement_px: 24
+  - name: local_bending
+    type: gaussian_bumps
+    n_bumps: 6
+    sigma_px: [30, 80]
+    max_displacement_px: 20
+    placement: foreground
+  - name: global_plus_local
+    type: sum
+    terms: [global_smooth, local_bending]
+  - name: multiscale
+    type: multiscale_bands
+    n_bands: 4
+    sigma_px: [128.0, 16.0]
+    per_band: 8
+    max_displacement_px: 8
+  - name: slip_band
+    type: shear_band
+    angle_deg: 35
+    width_px: 12
+    offset_px: 18
+    placement: foreground
+
+modality_mismatch:
+  - name: matched
+    loss: l2
+  - name: gamma
+    gamma: 0.55
+    intensity_scale: 0.80
+    intensity_offset: 0.02
+    loss: lncc
+  - name: gamma_noise
+    gamma: 0.55
+    intensity_scale: 0.80
+    intensity_offset: 0.02
+    poisson_gain: 60.0
+    read_noise_sigma: 0.010
+    loss: lncc
+
+models:
+  # A SIREN deformation field, in the same slot the hash grid occupies in
+  # ngp-demo.  omega_0 is the only scale knob it has: the field's finest feature
+  # is 12-23 px on a 904 px frame, which is 40-75 cycles, so the first layer is
+  # deliberately started well below that and the layers above fill in.
+  - name: siren
+    kind: siren
+    siren:
+      width: 256
+      hidden_layers: 3
+      omega_0: 30
+      outermost_linear: true
+    output_scale_px: 40
+    n_bands: 16
+    coarse_to_fine:
+      enabled: true
+      start_levels: 4
+      full_at_step: 1500
+  - name: siren_wide
+    inherits: siren
+    siren:
+      width: 512
+      hidden_layers: 3
+      omega_0: 30
+      outermost_linear: true
+  - name: siren_high_omega
+    inherits: siren
+    siren:
+      width: 256
+      hidden_layers: 3
+      omega_0: 120
+      outermost_linear: true
+  - name: siren_no_c2f
+    inherits: siren
+    coarse_to_fine:
+      enabled: false
+  - name: tensor_16
+    kind: control_grid
+    grid: [16, 16]
+    interpolation: bilinear
+    output_scale_px: 40
+  - name: tensor_64
+    inherits: tensor_16
+    grid: [64, 64]
+  - name: tensor_256
+    inherits: tensor_16
+    grid: [256, 256]
+
+training:
+  steps: 3000
+  batch: 65536
+  optimizer: adam
+  lr:
+    siren: 5.0e-4
+    control_grid: 5.0e-2
+  lr_schedule: cosine
+  lr_final_fraction: 0.03
+  sampling:
+    foreground_fraction: 0.9
+    jitter: subpixel
+  reg_batch: 8192
+  image_pyramid:
+    sigma_px: [16, 8, 4, 2, 0]
+    switch_at: [0.0, 0.15, 0.30, 0.45, 0.60]
+  loss:
+    lncc:
+      window_px: 9
+      n_patches: 1024
+    smoothness:
+      kind: gradient_l2
+      source: autograd
+      weight:
+        l2: 1.0e-3
+        lncc: 1.0
+    folding:
+      kind: hinge_negative_jacobian
+      source: autograd
+      weight:
+        l2: 1.0e-2
+        lncc: 1.0e+1
+
+metrics:
+  photometric:
+    - psnr_warped_vs_clean_target
+    - ncc_warped_vs_observed_target
+  field:
+    - endpoint_error_px_mean
+    - endpoint_error_px_p95
+    - endpoint_error_px_foreground
+    - endpoint_error_px_background
+    - endpoint_error_px_boundary_band
+  regularity:
+    - jacobian_det_min
+    - jacobian_det_negative_fraction
+    - bending_energy
+  cost:
+    - n_parameters
+    - seconds_to_within_1db_of_final
+    - peak_gpu_mb
+  evaluation:
+    resolution: full
+    boundary_band_px: 24
+    jacobian_from: autograd
+
+visualization:
+  warped_grid_overlay:
+    spacing_px: 32
+  level_hierarchy:
+    levels: [0, 4, 8, 11, 13]
+    draw_cells_on_image: true
+    partial_sum_reconstruction: true
+    per_level_displacement_norm: true
+  error_maps:
+    endpoint_error: true
+    jacobian_determinant: true
+  dpi: 130
+
+runs:
+  cross: [deformations, modality_mismatch, models]
+  repeats: 1
+  out: out/registration
