@@ -69,6 +69,19 @@ def cmap_png(a: np.ndarray, vmax: float, name="inferno", max_h: int = DISPLAY_H)
     return png_data_uri((cmap(x)[..., :3] * 255).astype(np.uint8), max_h)
 
 
+def field_png(a: np.ndarray, vmax: float, name="viridis",
+              max_h: int = DISPLAY_H) -> str:
+    """A SIGNED scalar field on a symmetric [-vmax, vmax], through viridis.
+
+    Symmetric because zero is a meaningful value in a wave and should land in the
+    same colour whatever the frame's own extremes are, and fixed because a panel
+    that rescales itself each refresh cannot be compared with the one beside it.
+    """
+    x = np.clip(a / max(vmax, 1e-6), -1.0, 1.0) * 0.5 + 0.5
+    return png_data_uri((matplotlib.colormaps[name](x)[..., :3] * 255).astype(np.uint8),
+                        max_h)
+
+
 def flow_png(u: np.ndarray, vmax: float, max_h: int = DISPLAY_H) -> str:
     """A displacement field as the optical-flow colour wheel: hue is direction,
     brightness is magnitude.
