@@ -117,6 +117,8 @@ JOB = {"running": False, "step": 0, "steps": 0, "seconds": 0.0, "curve": [],
 LOCK = threading.Lock()
 STOP = threading.Event()
 DATA = {}
+# The finished fit, kept so the play button can render any frame on demand.
+PLAY: dict = {}
 
 
 # ----------------------------------------------------------------- the data
@@ -248,6 +250,7 @@ def train_job(p, device):
         down = max(1, int(p["downsample"]))
         vol, n_frames, h, w, store = load_field(p["field"], down, device)
         vmax = float(vol.abs().max())
+        PLAY.clear()
         torch.manual_seed(0)
         model = build(p, w, h, n_frames).to(device)
         n_enc, n_mlp = model.n_parameters()
@@ -355,6 +358,8 @@ def train_job(p, device):
                     JOB["images"].update(imgs)
                     JOB["levels"] = lv
                     JOB["stamp"] += 1
+        PLAY.update(model=model, vol=vol, n_frames=n_frames, vmax=vmax,
+                    h=h, w=w, device=device)
     except Exception as e:
         print(f"[run] failed: {type(e).__name__}: {e}", flush=True)
         with LOCK:
@@ -419,9 +424,10 @@ one gets given up.</p>
 <div class="controls" id="controls"></div>
 <div class="knobs" id="knobs"></div>
 <div class="controls"><div class="group"><div class="label">&nbsp;</div>
-  <div class="seg"><button id="run">run</button><button id="stop">stop</button></div>
+  <div class="seg"><button id="run">run</button><button id="stop">stop</button><button id="play" style="display:none">play</button></div>
 </div></div>
 <div class="bar"><i id="prog"></i></div>
+<div id="playnote" class="note"></div>
 <div class="setup" id="setup"></div>
 <div class="row equal" style="margin-top:14px">
   <div class="panel"><canvas id="c_target0" width="300" height="300"></canvas>
@@ -672,10 +678,38 @@ async function poll(){
                        +`held-out frames <b>${m.psnr_held.toFixed(2)}</b> dB` : "")
        +`<br><span style="color:#7a7a7a">${r.note}</span>`;
   }
+  showPlay(!r.running && r.step > 0);
   if(r.running) SEEN=true;
   if(SEEN && !r.running && POLL){ clearInterval(POLL); POLL=null; }
 }
 poll();
+// The play button: the run frame by frame, target beside fit, in the two left
+// panels.  Hidden until a fit has finished, because there is nothing to infer
+// from an untrained model and a half-trained one is already on the panels.
+let PLAYING=false, PLAYAT=0;
+function showPlay(on){
+  const b=document.getElementById("play");
+  b.style.display = on ? "" : "none";
+}
+async function playStep(){
+  if(!PLAYING) return;
+  let r;
+  try { r = await (await fetch("/api/frame?i="+PLAYAT)).json(); }
+  catch(e){ PLAYING=false; return; }
+  if(r.error){ PLAYING=false; document.getElementById("play").textContent="play";
+               return; }
+  drawImg("c_target0", r.target);
+  drawImg("c_fit0", r.fit);
+  document.getElementById("playnote").textContent =
+    `frame ${r.i + 1} / ${r.n}`;
+  PLAYAT = (r.i + 1) % r.n;
+  setTimeout(playStep, 40);
+}
+document.getElementById("play").onclick=()=>{
+  PLAYING = !PLAYING;
+  document.getElementById("play").textContent = PLAYING ? "pause" : "play";
+  if(PLAYING) playStep();
+};
 </script></body></html>
 """
 
@@ -734,6 +768,22 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/clienterror":
             print(f"[client] {q.get('msg', '')}", flush=True)
             return self._send(json.dumps({"ok": True}), "application/json")
+        if u.path == "/api/frame":
+            # One frame, target and fit, rendered on demand: 201 frames of two
+            # panels is a lot of png to send for something watched once.
+            if not PLAY:
+                return self._send(json.dumps({"error": "no finished fit"}),
+                                  "application/json")
+            i = max(0, min(PLAY["n_frames"] - 1, int(float(q.get("i", 0)))))
+            t = i / max(1, PLAY["n_frames"] - 1)
+            with torch.no_grad():
+                c = frame_coords(PLAY["h"], PLAY["w"], t, PLAY["device"])
+                fit = render(PLAY["model"], c, (PLAY["h"], PLAY["w"]))
+            return self._send(json.dumps(
+                {"i": i, "n": PLAY["n_frames"],
+                 "target": field_png(PLAY["vol"][i].cpu().numpy(), PLAY["vmax"]),
+                 "fit": field_png(fit.cpu().numpy(), PLAY["vmax"])}),
+                "application/json")
         if u.path == "/api/state":
             with LOCK:
                 return self._send(json.dumps(JOB), "application/json")
@@ -771,7 +821,10 @@ def main():
         print(f"no store under {a.zarr_glob} yet -- the page will rescan on "
               f"every run. Beside it: {', '.join(near[:8]) or 'nothing'}",
               flush=True)
-    DEFAULTS["field"] = "sum" if "sum" in DATASETS else sorted(DATASETS)[0]
+    # "sum" even when nothing is on disk: the page rescans on every run, so the
+    # selector has to hold a name until a store appears.
+    DEFAULTS["field"] = ("sum" if "sum" in DATASETS or not DATASETS
+                         else sorted(DATASETS)[0])
     Handler.device = torch.device(a.device)
     try:
         srv = ThreadingHTTPServer(("0.0.0.0", a.port), Handler)

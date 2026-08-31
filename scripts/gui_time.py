@@ -57,6 +57,9 @@ JOB = {"running": False, "step": 0, "steps": 0, "seconds": 0.0, "curve": [],
 LOCK = threading.Lock()
 STOP = threading.Event()
 SCENE: dict = {}
+# The finished fit, kept so the play button can render any frame on demand.  A
+# run replaces it; nothing else touches it, so playing cannot disturb a fit.
+PLAY: dict = {}
 
 
 def get_scene(cfg, device):
@@ -107,6 +110,7 @@ def train_job(cfg, p, device):
         n_values = n_frames * shape[0] * shape[1] * 2
         compression = n_values / max(1, n_enc + n_mlp)
         picks = [0, n_frames // 2, n_frames - 1]
+        PLAY.clear()
         with LOCK:
             JOB.update(running=True, step=0, steps=int(p["steps"]), seconds=0.0,
                        curve=[], per_frame=[], note=note, frames=picks,
@@ -182,6 +186,8 @@ def train_job(cfg, p, device):
                     JOB["grids"] = grids
                     JOB["levels"] = levels
                     JOB["stamp"] += 1
+        PLAY.update(model=model, gt=gt, src=src, shape=shape,
+                    n_frames=n_frames, device=device)
     except Exception as e:
         print(f"[run] failed: {type(e).__name__}: {e}", flush=True)
         with LOCK:
@@ -335,9 +341,10 @@ scores every frame so which one is happening is a fact.</p>
 <div class="controls" id="controls"></div>
 <div class="knobs" id="knobs"></div>
 <div class="controls"><div class="group"><div class="label">&nbsp;</div>
-  <div class="seg"><button id="run">run</button><button id="stop">stop</button></div>
+  <div class="seg"><button id="run">run</button><button id="stop">stop</button><button id="play" style="display:none">play</button></div>
 </div></div>
 <div class="bar"><i id="prog"></i></div>
+<div id="playnote" class="note"></div>
 <div class="setup" id="setup"></div>
 <div class="row equal" style="margin-top:8px">
   <div class="panel"><canvas id="c_target0" width="300" height="380"></canvas>
@@ -588,6 +595,7 @@ function drawCurve(c){
 async function poll(){
   const r=await (await fetch("/api/state")).json();
   document.getElementById("prog").style.width=(r.steps?(r.step/r.steps*100):0)+"%";
+  showPlay(!r.running && r.step > 0);
   if(r.running) SEEN_RUNNING=true;
   if(r.stamp!==LAST){
     LAST=r.stamp;
@@ -628,6 +636,33 @@ async function poll(){
   if(SEEN_RUNNING && !r.running && POLL){ clearInterval(POLL); POLL=null; }
 }
 poll(); startRun();
+// The play button: the run frame by frame, target beside fit, in the two left
+// panels.  Hidden until a fit has finished, because there is nothing to infer
+// from an untrained model and a half-trained one is already on the panels.
+let PLAYING=false, PLAYAT=0;
+function showPlay(on){
+  const b=document.getElementById("play");
+  b.style.display = on ? "" : "none";
+}
+async function playStep(){
+  if(!PLAYING) return;
+  let r;
+  try { r = await (await fetch("/api/frame?i="+PLAYAT)).json(); }
+  catch(e){ PLAYING=false; return; }
+  if(r.error){ PLAYING=false; document.getElementById("play").textContent="play";
+               return; }
+  drawImg("c_target0", r.target);
+  drawImg("c_fit0", r.fit);
+  document.getElementById("playnote").textContent =
+    `frame ${r.i + 1} / ${r.n}`;
+  PLAYAT = (r.i + 2) % r.n;
+  setTimeout(playStep, 40);
+}
+document.getElementById("play").onclick=()=>{
+  PLAYING = !PLAYING;
+  document.getElementById("play").textContent = PLAYING ? "pause" : "play";
+  if(PLAYING) playStep();
+};
 </script></body></html>
 """
 
@@ -706,6 +741,23 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/stop":
             STOP.set()
             return self._send(json.dumps({"ok": True}), "application/json")
+        if u.path == "/api/frame":
+            # One frame of the run, target and fit, rendered on demand. The page
+            # asks for them one at a time rather than being sent a movie: 800
+            # frames of two 300 px panels is 50 MB of png that nobody watches
+            # twice.
+            if not PLAY:
+                return self._send(json.dumps({"error": "no finished fit"}),
+                                  "application/json")
+            i = max(0, min(PLAY["n_frames"] - 1, int(float(q.get("i", 0)))))
+            t = i / max(1, PLAY["n_frames"] - 1)
+            with torch.no_grad():
+                tgt = warp_t(PLAY["src"], PLAY["gt"], t, PLAY["shape"])
+                fit = warp_model(PLAY["src"], PLAY["model"], PLAY["shape"], t,
+                                 PLAY["device"])
+            return self._send(json.dumps(
+                {"i": i, "n": PLAY["n_frames"], "target": gray_png(tgt),
+                 "fit": gray_png(fit)}), "application/json")
         if u.path == "/api/state":
             with LOCK:
                 return self._send(json.dumps(JOB), "application/json")
