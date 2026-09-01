@@ -446,7 +446,10 @@ one gets given up.</p>
 <div class="controls" id="controls"></div>
 <div class="knobs" id="knobs"></div>
 <div class="controls"><div class="group"><div class="label">&nbsp;</div>
-  <div class="seg"><button id="run">run</button><button id="stop">stop</button><button id="play" style="display:none">play</button></div>
+  <div class="seg"><button id="run">run</button><button id="stop">stop</button></div>
+</div>
+<div class="group"><div class="label">&nbsp;</div>
+  <div class="seg" id="playseg" style="display:none"><button id="play">play</button></div>
 </div></div>
 <div class="bar"><i id="prog"></i></div>
 <div id="playnote" class="note"></div>
@@ -675,7 +678,9 @@ async function poll(){
     PARAMS=` <span class="dim">&middot;</span> <span style="color:#fff">`
       +`${m.n_parameters.toLocaleString()} parameters, `
       +`${m.n_table.toLocaleString()} in the first layer, `
-      +`<b>${m.compression.toFixed(1)}x</b> compression against the `
+      +`<b style="color:${m.compression > 2 ? "#2ea043"
+                        : m.compression > 1 ? "#e5a23c" : "#e5484d"}">`
+      +`${m.compression.toFixed(1)}x</b> compression against the `
       +`${m.n_values.toLocaleString()} stored values</span>`;
     setup();
   }
@@ -708,8 +713,10 @@ poll();
 // from an untrained model and a half-trained one is already on the panels.
 let PLAYING=false, PLAYAT=0;
 function showPlay(on){
-  const b=document.getElementById("play");
-  b.style.display = on ? "" : "none";
+  // The GROUP, not the button: a hidden button inside the seg is still its
+  // last-child, and .seg button:last-child is what draws the right-hand border,
+  // so hiding it that way cut the edge off the button before it.
+  document.getElementById("playseg").style.display = on ? "" : "none";
 }
 async function playStep(){
   if(!PLAYING) return;
@@ -757,9 +764,13 @@ class Handler(BaseHTTPRequestHandler):
                         .replace("__ABOUT__", ABOUT_HTML)
                         .replace("__KNOBS__", json.dumps(KNOBS))
                         .replace("__DEF__", json.dumps(DEFAULTS))
+                        # Whatever is on disk right now, sum first. Filtering
+                        # against a fixed list of names is what emptied this menu
+                        # when the labels gained their resolution.
                         .replace("__DATASETS__",
-                                 json.dumps([k for k in ("sum", "coarse", "fine")
-                                             if k in DATASETS]))
+                                 json.dumps(sorted(datasets(ZARR_GLOB),
+                                                   key=lambda k:
+                                                   (not k.startswith("sum"), k))))
                         .replace("__LUTMAX__", str(LEVEL_LUT_MAX))
                         .replace("__ERRMAX__", f"{ERROR_LUT_MAX:g}"))
             return self._send(page, "text/html; charset=utf-8")
