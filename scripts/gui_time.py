@@ -92,7 +92,10 @@ def _frame_pngs(i):
         tgt = warp_t(PLAY["src"], PLAY["gt"], t, PLAY["shape"])
         fit = warp_model(PLAY["src"], PLAY["model"], PLAY["shape"], t,
                          PLAY["device"])
-    out = (gray_png(tgt), gray_png(fit))
+    # And the photometric residual, on the same fixed scale the static panels
+    # use, so playback shows what the loss sees and not only what the eye does.
+    out = (gray_png(tgt), gray_png(fit),
+           cmap_png((fit - tgt).abs().cpu().numpy(), RESID_LUT_MAX))
     PLAY["cache"][i] = out
     return out
 
@@ -705,6 +708,7 @@ async function playStep(){
                return; }
   drawImg("c_target0", r.target);
   drawImg("c_fit0", r.fit);
+  drawImg("c_resid0", r.resid);
   document.getElementById("playnote").textContent =
     `frame ${r.i + 1} / ${r.n}` + (PLAYSPEED === 1 ? "" :
       `   x${PLAYSPEED}, ${2 * Math.max(1, Math.round(PLAYSPEED))} `
@@ -804,10 +808,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(json.dumps({"error": "no finished fit"}),
                                   "application/json")
             i = max(0, min(PLAY["n_frames"] - 1, int(float(q.get("i", 0)))))
-            tgt, fit = _frame_pngs(i)
+            tgt, fit, resid = _frame_pngs(i)
             return self._send(json.dumps(
                 {"i": i, "n": PLAY["n_frames"], "target": tgt, "fit": fit,
-                 "ready": PLAY.get("ready", 0)}), "application/json")
+                 "resid": resid, "ready": PLAY.get("ready", 0)}),
+                "application/json")
         if u.path == "/api/state":
             with LOCK:
                 return self._send(json.dumps(JOB), "application/json")

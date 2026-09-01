@@ -509,9 +509,14 @@ def _frame_pngs(i):
     with torch.no_grad():
         c = frame_coords(PLAY["h"], PLAY["w"], t, PLAY["device"])
         fit = render(PLAY["model"], c, (PLAY["h"], PLAY["w"]))
+    # The residual travels with them: a fit that looks right beside its target
+    # and a fit whose error is structured look identical until they are put side
+    # by side, and playback is exactly where that shows.
+    d = (fit - PLAY["vol"][i]).cpu().numpy()
     out = (field_png(PLAY["vol"][i].cpu().numpy(), PLAY["vmax"],
                      lo=PLAY["lo"], hi=PLAY["hi"]),
-           field_png(fit.cpu().numpy(), PLAY["vmax"], lo=PLAY["lo"], hi=PLAY["hi"]))
+           field_png(fit.cpu().numpy(), PLAY["vmax"], lo=PLAY["lo"], hi=PLAY["hi"]),
+           png_data_uri(signed_rgb(d, PLAY["err_max"])))
     PLAY["cache"][i] = out
     return out
 
@@ -666,7 +671,8 @@ def train_job(p, device):
                     JOB["levels"] = lv
                     JOB["stamp"] += 1
         PLAY.update(model=model, vol=vol, n_frames=n_frames, vmax=vmax,
-                    lo=lo, hi=hi, h=h, w=w, device=device, cache={}, ready=0)
+                    lo=lo, hi=hi, err_max=err_max, h=h, w=w, device=device,
+                    cache={}, ready=0)
         threading.Thread(target=_prefetch, args=(PLAY.get("token"),),
                          daemon=True).start()
     except Exception as e:
@@ -1043,6 +1049,7 @@ async function playStep(){
                return; }
   drawImg("c_target0", r.target);
   drawImg("c_fit0", r.fit);
+  drawImg("c_err0", r.resid);
   document.getElementById("playnote").textContent =
     `frame ${r.i + 1} / ${r.n}` + (PLAYSPEED === 1 ? "" :
       `   x${PLAYSPEED}, ${1 * Math.max(1, Math.round(PLAYSPEED))} `
@@ -1125,10 +1132,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(json.dumps({"error": "no finished fit"}),
                                   "application/json")
             i = max(0, min(PLAY["n_frames"] - 1, int(float(q.get("i", 0)))))
-            tgt, fit = _frame_pngs(i)
+            tgt, fit, resid = _frame_pngs(i)
             return self._send(json.dumps(
                 {"i": i, "n": PLAY["n_frames"], "target": tgt, "fit": fit,
-                 "ready": PLAY.get("ready", 0)}), "application/json")
+                 "resid": resid, "ready": PLAY.get("ready", 0)}),
+                "application/json")
         if u.path == "/api/state":
             with LOCK:
                 return self._send(json.dumps(JOB), "application/json")
