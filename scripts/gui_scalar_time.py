@@ -362,16 +362,67 @@ def band_montage(model, h, w, t, device, side=110, cols=4):
     finally:
         model.set_unit_gain(keep)
 
+    return _sheet(tiles, labels, cols)
+
+
+@torch.no_grad()
+def band_kymograph(model, h, w, n_frames, device, side=110, cols=4):
+    """The temporal pendant of the band montage: what each band adds, in TIME.
+
+    One horizontal line through the field swept over every frame, so each tile
+    is x across and t down.  A SIREN has nothing to label a tile with here: its
+    bands are ordered by |w_i|, which mixes the x, y AND t components of the
+    same weight vector, so a band has no separate time resolution to quote --
+    which is itself the difference from the grid twin, where every level carries
+    its own cells-along-t.
+    """
+    ny = max(16, min(side, n_frames))
+    nx = max(16, side)
+    y = torch.full((nx * ny,), 0.5, device=device)
+    xs = pixel_centers(1, nx, device)[:, 0].repeat(ny)
+    ts = torch.arange(ny, device=device).float().repeat_interleave(nx) / max(1, ny - 1)
+    xyt = torch.stack([xs, y, ts], dim=1)
+    keep = model.unit_gain.clone()
+    cache = {}
+
+    def upto(k):
+        if k not in cache:
+            g = torch.zeros_like(model.unit_gain)
+            if k >= 0:
+                g[model.band_of(N_BANDS) <= k] = 1.0
+            model.set_unit_gain(g)
+            cache[k] = model(xyt)[:, 0].reshape(ny, nx)
+        return cache[k]
+
+    bands = list(range(N_BANDS))[-(cols * cols - 1):]
+    tiles, labels = [], []
+    try:
+        b0 = bands[0] - 1
+        a = upto(b0)
+        v = np.clip(a.cpu().numpy() / max(1e-6, float(a.abs().max())), -1, 1) * .5 + .5
+        tiles.append((matplotlib.colormaps["viridis"](v)[..., :3] * 255).astype(np.uint8))
+        labels.append(f"0..{b0}")
+        for b in bands:
+            d = upto(b) - upto(b - 1)
+            tiles.append(signed_rgb(d.cpu().numpy(), MONTAGE_LUT_MAX))
+            labels.append(f"B{b}")
+    finally:
+        model.set_unit_gain(keep)
+    return _sheet(tiles, labels, cols)
+
+
+def _sheet(tiles, labels, cols=4, gap=2):
+    """Tiles into one labelled picture."""
     th, tw, _ = tiles[0].shape
     rows = (len(tiles) + cols - 1) // cols
-    sheet = np.zeros((rows * (th + 2) - 2, cols * (tw + 2) - 2, 3), np.uint8)
+    sheet = np.zeros((rows * (th + gap) - gap, cols * (tw + gap) - gap, 3), np.uint8)
     for i, tile in enumerate(tiles):
-        y, x = (i // cols) * (th + 2), (i % cols) * (tw + 2)
+        y, x = (i // cols) * (th + gap), (i % cols) * (tw + gap)
         sheet[y:y + th, x:x + tw] = tile
     im = Image.fromarray(sheet)
     dr = ImageDraw.Draw(im)
     for i, lab in enumerate(labels):
-        dr.text(((i % cols) * (tw + 2) + 2, (i // cols) * (th + 2) + 1), lab,
+        dr.text(((i % cols) * (tw + gap) + 2, (i // cols) * (th + gap) + 1), lab,
                 fill=(255, 255, 255))
     buf = io.BytesIO()
     im.save(buf, format="PNG")
@@ -465,6 +516,7 @@ def train_job(p, device):
                                                  fr / max(1, n_frames - 1), device)
                     imgs["montage"] = band_montage(
                         model, h, w, picks[1] / max(1, n_frames - 1), device)
+                    imgs["kymo"] = band_kymograph(model, h, w, n_frames, device)
                     # every frame, on a coarse grid: cheap, and the only way to
                     # see a fit that is good at the ends and lost in between
                     hs, ws = h // 4, w // 4
@@ -599,9 +651,14 @@ one gets given up.</p>
     <div class="cap">bands</div></div>
   <div class="panel"><canvas id="c_lev2" width="300" height="300"></canvas>
     <div class="cap">bands</div></div>
+</div>
+<div class="row grid3" style="margin-top:8px">
   <div class="panel"><canvas id="c_montage" width="300" height="300"></canvas>
-    <div class="cap">what each band adds, middle frame &mdash; signed,
+    <div class="cap">what each band adds in SPACE, middle frame &mdash; signed,
       fixed &plusmn;__MONTMAX__</div></div>
+  <div class="panel"><canvas id="c_kymo" width="300" height="300"></canvas>
+    <div class="cap">what each band adds in TIME &mdash; x across, t down,
+      through the middle row</div></div>
 </div>
 <div id="levlegend" class="note"></div>
 <div class="row" style="margin-top:14px">
@@ -810,6 +867,7 @@ async function poll(){
       drawLevels("c_lev"+i, LASTLEV[String(i)], "c_target"+i);
     }
     drawImg("c_montage", (r.images||{}).montage);
+    drawImg("c_kymo", (r.images||{}).kymo);
     drawCurve(r.curve); drawFrames(r.per_frame);
     document.getElementById("stats").innerHTML = m.psnr===undefined ? "press run"
       : `iteration <b>${r.step}</b> / ${r.steps} &nbsp;&middot;&nbsp; `

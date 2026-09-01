@@ -160,6 +160,12 @@ CSS = """
   .row.grid4 .panel { min-width:0; }
   .row.grid4 .span2 { grid-column:span 2; }
   .row.grid4 canvas { width:100%; height:auto; }
+  /* Three columns on the same track, for a row that should line up with a
+     three-panel row above it however few panels it holds. */
+  .row.grid3 { display:grid; grid-template-columns:repeat(3, 1fr); gap:18px;
+               align-items:start; }
+  .row.grid3 .panel { min-width:0; }
+  .row.grid3 canvas { width:100%; height:auto; }
   .cap { font-size:10px; letter-spacing:.14em; text-transform:uppercase;
          color:var(--dim); }
   .cap i { color:var(--red); font-style:normal; }
