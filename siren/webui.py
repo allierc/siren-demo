@@ -69,17 +69,44 @@ def cmap_png(a: np.ndarray, vmax: float, name="inferno", max_h: int = DISPLAY_H)
     return png_data_uri((cmap(x)[..., :3] * 255).astype(np.uint8), max_h)
 
 
-def field_png(a: np.ndarray, vmax: float, name="viridis",
+def field_png(a: np.ndarray, vmax: float, name="viridis", lo=None, hi=None,
               max_h: int = DISPLAY_H) -> str:
-    """A SIGNED scalar field on a symmetric [-vmax, vmax], through viridis.
+    """A scalar field through viridis, on a FIXED range given by the data.
 
-    Symmetric because zero is a meaningful value in a wave and should land in the
-    same colour whatever the frame's own extremes are, and fixed because a panel
-    that rescales itself each refresh cannot be compared with the one beside it.
+    Symmetric about zero when the field is signed, because zero is a meaningful
+    value in a wave and should land in the same colour whatever a frame's own
+    extremes are.  One-sided when it is not: a redox ratio runs 0 to 2.88 but its
+    99.9th percentile is 1.24, so a symmetric +-2.88 ramp spends 96% of itself on
+    values that do not occur and the organoid reads as one flat green.  Either
+    way the range is fixed for the run, so a panel does not rescale itself while
+    the fit improves.
     """
-    x = np.clip(a / max(vmax, 1e-6), -1.0, 1.0) * 0.5 + 0.5
+    if lo is None or hi is None:
+        lo, hi = -abs(vmax), abs(vmax)
+    x = np.clip((a - lo) / max(hi - lo, 1e-9), 0.0, 1.0)
     return png_data_uri((matplotlib.colormaps[name](x)[..., :3] * 255).astype(np.uint8),
                         max_h)
+
+
+def display_range(v, signed_frac=0.01, p=99.9):
+    """(lo, hi) for a volume: robust, and symmetric only if it has to be.
+
+    The percentile rather than the extreme, because one hot pixel should not set
+    the scale for the other million.  Symmetric when more than `signed_frac` of
+    the field is meaningfully negative -- a wave -- and one-sided otherwise -- an
+    intensity, a ratio, a rate.
+    """
+    v = v.detach().cpu().numpy() if hasattr(v, "detach") else v
+    s = np.asarray(v).ravel()
+    if s.size > 2_000_000:
+        s = s[:: s.size // 2_000_000]
+    hi = float(np.percentile(s, p))
+    lo = float(np.percentile(s, 100 - p))
+    neg = float((s < -0.01 * max(abs(hi), 1e-9)).mean())
+    if neg > signed_frac:
+        m = max(abs(lo), abs(hi))
+        return -m, m
+    return min(lo, 0.0), hi
 
 
 def flow_png(u: np.ndarray, vmax: float, max_h: int = DISPLAY_H) -> str:
