@@ -492,6 +492,50 @@ def _sheet(tiles, labels, cols=4, gap=2):
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
+
+def _frame_pngs(i):
+    """target and fit for frame i, from the cache when it is there.
+
+    The renders are cheap -- 4 ms for the model, 1.7 ms for each png at 256x166
+    -- but at panel resolution over a round trip they came to about 40 ms, which
+    is the whole of the playback budget.  Every frame is rendered once, kept as
+    the two data URIs the page will ask for, and served from memory after that:
+    256 frames of two panels is about 50 MB and playback stops touching the GPU.
+    """
+    hit = PLAY["cache"].get(i)
+    if hit is not None:
+        return hit
+    t = i / max(1, PLAY["n_frames"] - 1)
+    with torch.no_grad():
+        c = frame_coords(PLAY["h"], PLAY["w"], t, PLAY["device"])
+        fit = render(PLAY["model"], c, (PLAY["h"], PLAY["w"]))
+    out = (field_png(PLAY["vol"][i].cpu().numpy(), PLAY["vmax"],
+                     lo=PLAY["lo"], hi=PLAY["hi"]),
+           field_png(fit.cpu().numpy(), PLAY["vmax"], lo=PLAY["lo"], hi=PLAY["hi"]))
+    PLAY["cache"][i] = out
+    return out
+
+
+def _prefetch(token, budget=1024):
+    """Fill the frame cache in the background as soon as a fit finishes.
+
+    On its own thread and abandoned the moment another run starts, so a fit is
+    never waiting on it.  Skipped above `budget` frames, where the cache would
+    cost more memory than the playback is worth.
+    """
+    n = PLAY.get("n_frames", 0)
+    if n > budget:
+        return
+    for i in range(n):
+        if PLAY.get("token") != token:
+            return
+        try:
+            _frame_pngs(i)
+        except Exception:
+            return
+        PLAY["ready"] = i + 1
+    print(f"[play  ] {n} frames cached, playback is now local", flush=True)
+
 def train_job(p, device):
     try:
         down = max(1, int(p["downsample"]))
@@ -505,6 +549,7 @@ def train_job(p, device):
         lo, hi = display_range(vol)
         err_max = max(1e-6, 0.05 * (hi - lo))
         PLAY.clear()
+        PLAY["token"] = PLAY.get("token", 0) + 1
         torch.manual_seed(0)
         model = build(p, w, h, n_frames).to(device)
         n_enc, n_mlp = model.n_parameters()
@@ -621,7 +666,9 @@ def train_job(p, device):
                     JOB["levels"] = lv
                     JOB["stamp"] += 1
         PLAY.update(model=model, vol=vol, n_frames=n_frames, vmax=vmax,
-                    lo=lo, hi=hi, h=h, w=w, device=device)
+                    lo=lo, hi=hi, h=h, w=w, device=device, cache={}, ready=0)
+        threading.Thread(target=_prefetch, args=(PLAY.get("token"),),
+                         daemon=True).start()
     except Exception as e:
         print(f"[run] failed: {type(e).__name__}: {e}", flush=True)
         with LOCK:
@@ -696,7 +743,10 @@ one gets given up.</p>
   <div class="seg"><button id="run">run</button><button id="stop">stop</button></div>
 </div>
 <div class="group"><div class="label">&nbsp;</div>
-  <div class="seg" id="playseg" style="display:none"><button id="play">play</button></div>
+  <div class="seg" id="playseg" style="display:none"><button id="play">play</button>
+    <button class="sp" data-s="0.5">x0.5</button><button class="sp" data-s="1"
+    aria-pressed="true">x1</button><button class="sp" data-s="2">x2</button>
+    <button class="sp" data-s="4">x4</button></div>
 </div></div>
 <div class="bar"><i id="prog"></i></div>
 <div id="playnote" class="note"></div>
@@ -969,7 +1019,15 @@ poll();
 // The play button: the run frame by frame, target beside fit, in the two left
 // panels.  Hidden until a fit has finished, because there is nothing to infer
 // from an untrained model and a half-trained one is already on the panels.
-let PLAYING=false, PLAYAT=0;
+let PLAYING=false, PLAYAT=0, PLAYSPEED=1;
+// Speed moves BOTH the timer and the stride. The server renders a frame in
+// about 40 ms, so asking for them faster than that just queues; skipping frames
+// is what actually makes the run play quicker.
+document.querySelectorAll("#playseg .sp").forEach(b=>{
+  b.onclick=()=>{ PLAYSPEED=parseFloat(b.dataset.s);
+    document.querySelectorAll("#playseg .sp").forEach(o=>
+      o.setAttribute("aria-pressed", o===b)); };
+});
 function showPlay(on){
   // The GROUP, not the button: a hidden button inside the seg is still its
   // last-child, and .seg button:last-child is what draws the right-hand border,
@@ -986,7 +1044,9 @@ async function playStep(){
   drawImg("c_target0", r.target);
   drawImg("c_fit0", r.fit);
   document.getElementById("playnote").textContent =
-    `frame ${r.i + 1} / ${r.n}`;
+    `frame ${r.i + 1} / ${r.n}` + (PLAYSPEED === 1 ? "" :
+      `   x${PLAYSPEED}, ${1 * Math.max(1, Math.round(PLAYSPEED))} `
+      + `frames per step`);
   PLAYAT = (r.i + 1) % r.n;
   setTimeout(playStep, 40);
 }
@@ -1065,17 +1125,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(json.dumps({"error": "no finished fit"}),
                                   "application/json")
             i = max(0, min(PLAY["n_frames"] - 1, int(float(q.get("i", 0)))))
-            t = i / max(1, PLAY["n_frames"] - 1)
-            with torch.no_grad():
-                c = frame_coords(PLAY["h"], PLAY["w"], t, PLAY["device"])
-                fit = render(PLAY["model"], c, (PLAY["h"], PLAY["w"]))
+            tgt, fit = _frame_pngs(i)
             return self._send(json.dumps(
-                {"i": i, "n": PLAY["n_frames"],
-                 "target": field_png(PLAY["vol"][i].cpu().numpy(), PLAY["vmax"],
-                                     lo=PLAY["lo"], hi=PLAY["hi"]),
-                 "fit": field_png(fit.cpu().numpy(), PLAY["vmax"],
-                                  lo=PLAY["lo"], hi=PLAY["hi"])}),
-                "application/json")
+                {"i": i, "n": PLAY["n_frames"], "target": tgt, "fit": fit,
+                 "ready": PLAY.get("ready", 0)}), "application/json")
         if u.path == "/api/state":
             with LOCK:
                 return self._send(json.dumps(JOB), "application/json")
