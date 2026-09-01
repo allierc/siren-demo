@@ -124,6 +124,14 @@ def datasets(pattern=None):
         if part is None:                       # no summary: fall back on the name
             part = ("coarse" if "coarse" in name else
                     "fine" if "fine" in name else "both")
+        # The toy generator writes one part per run and the menu names them by
+        # part and resolution.  Anything else -- a real dataset prepared by
+        # scripts/prepare_datasets.py -- is named after its own directory,
+        # because "fine v 256" would collapse two zapbench cuts of the same size
+        # into one entry and silently drop a dataset.
+        if not name.startswith("toy"):
+            out[name.replace("_", " ")] = (None, d)
+            continue
         if part == "both":
             both[_grid_size(d, "u")] = d
             us.setdefault(_grid_size(d, "u"), d)

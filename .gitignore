@@ -3,3 +3,4 @@ logs/
 papers/
 __pycache__/
 *.pyc
+data/
