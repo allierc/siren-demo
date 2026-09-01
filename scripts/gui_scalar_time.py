@@ -280,10 +280,24 @@ N_BANDS = 16
 
 
 def build(p, w, h, n_frames):
-    return SirenField(
+    """The SIREN, with the time axis stretched to the requested scale.
+
+    There is no time axis to cap here: x, y and t are three inputs to one bank
+    of plane waves and omega_0 multiplies all of them.  The equivalent knob is
+    the coordinate itself -- feeding t * s makes every first-layer wave s times
+    faster along t -- so "frames per finest cycle" is met by solving for s from
+    the initialised weights and reading the result back.
+    """
+    m = SirenField(
         n_input_dims=3, n_output_dims=1, output_activation="none",
         width=int(p["width"]), hidden_layers=int(p["hidden_layers"]),
         omega_0=float(p["omega_0"]), outermost_linear=True)
+    fpc = max(1.0, float(p["frames_per_finest_cycle"]))
+    want = n_frames / fpc                      # cycles across the run
+    have = float(m.frequencies(axis=2).max())  # before any stretch
+    if have > 1e-9:
+        m.input_scale[2] = want / have
+    return m
 
 
 @torch.no_grad()
@@ -456,8 +470,10 @@ def train_job(p, device):
                 f"{int(p['hidden_layers'])} layers, omega_0 "
                 f"{float(p['omega_0']):g}, first-layer waves "
                 f"{float(freq.min()):.2f}..{float(freq.max()):.2f} cycles "
-                f"= {w / max(float(freq.max()), 1e-6):.0f} px per finest cycle "
-                f"(x, y and t alike)"
+                f"= {w / max(float(freq.max()), 1e-6):.0f} px per finest cycle; "
+                f"t stretched x{float(model.input_scale[2]):.1f} for "
+                f"{n_frames / max(float(model.frequencies(axis=2).max()), 1e-9):.1f} "
+                f"frames per finest cycle along t"
                 + (f"; {len(held)} frames held out" if held else ""))
         print(f"[run] {note}", flush=True)
         print(f"[params] {n_enc + n_mlp:,} total = {n_enc:,} in the first layer "
@@ -577,8 +593,14 @@ KNOBS = {
         # starts the first layer near 13 cycles and leaves the rest to the
         # layers above; the learning rate below is the measured ceiling for it,
         # omega_0 * lr = 0.03.
-        {"name": "omega_0", "label": "omega_0 (x, y and t alike)", "min": 5,
+        {"name": "omega_0", "label": "omega_0 (x and y)", "min": 5,
          "max": 1000, "default": 120, "step": 1, "log": True},
+        # The hash grid caps its time axis in frames per cell. A SIREN has no
+        # axis to cap, so the same request is met by stretching t before the
+        # first layer: the scale is solved for from the initialised weights so
+        # the fastest first-layer wave along t has this period.
+        {"name": "frames_per_finest_cycle", "label": "frames per finest cycle",
+         "choices": [1, 2, 4, 8, 16], "default": 2},
     ],
     "train": [
         {"name": "lr", "label": "learning rate", "min": 1e-6, "max": 1e-2,

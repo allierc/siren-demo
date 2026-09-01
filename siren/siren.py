@@ -178,6 +178,15 @@ class SirenField(nn.Module):
         # One gain per first-layer unit, all on.  The twin of
         # MultiResHashGrid.level_gain, and used the same way.
         self.register_buffer("unit_gain", torch.ones(width), persistent=False)
+        # A per-axis scale on the INPUT, which is the only way this network can
+        # be told that one axis wants a different scale from another.  A hash
+        # grid caps each axis separately -- N_max in x, cells along t -- because
+        # its levels are lattices with an extent per axis.  A SIREN has one
+        # omega_0 for the whole coordinate, so the only equivalent is to stretch
+        # the coordinate itself: feeding t * s makes every first-layer wave s
+        # times faster along t and leaves x and y alone.
+        self.register_buffer("input_scale", torch.ones(n_input_dims),
+                             persistent=False)
 
     # --------------------------------------------------------------- the ladder
 
@@ -190,13 +199,17 @@ class SirenField(nn.Module):
         return float(w.item() if isinstance(w, torch.Tensor) else w)
 
     @torch.no_grad()
-    def frequencies(self) -> torch.Tensor:
+    def frequencies(self, axis: int | None = None) -> torch.Tensor:
         """(width,) cycles across the unit domain, one per first-layer unit.
 
         The unit computes sin(w0 * (w_i . x + b_i)); along the direction of w_i that
         is a wave of w0 * |w_i| radians per unit length, so w0 * |w_i| / 2pi cycles.
+        With `axis`, the component along that input axis alone -- which is how a
+        time frequency is read off a network that has no time axis.
         """
-        return self.omega() * self.first.linear.weight.norm(dim=1) / (2 * np.pi)
+        w = self.first.linear.weight * self.input_scale
+        w = w[:, axis].abs() if axis is not None else w.norm(dim=1)
+        return self.omega() * w / (2 * np.pi)
 
     @torch.no_grad()
     def band_of(self, n_bands: int = 16) -> torch.Tensor:
@@ -231,6 +244,8 @@ class SirenField(nn.Module):
     # --------------------------------------------------------------- evaluation
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not bool(torch.all(self.input_scale == 1)):
+            x = x * self.input_scale
         h = self.first(x)
         if not bool(torch.all(self.unit_gain == 1)):
             h = h * self.unit_gain
