@@ -28,7 +28,9 @@ selector fits either half alone to see which one it gives up.
 from __future__ import annotations
 
 import argparse
+import base64
 import glob
+import io
 import json
 import math
 import os
@@ -49,6 +51,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from siren import SirenField
 from siren.utils import pixel_centers, render
+from PIL import Image, ImageDraw
+
 from siren.webui import ABOUT_HTML, CSS, cmap_png, field_png, signed_rgb, png_data_uri
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -84,18 +88,22 @@ def _grid_rank(store):
 
 
 def datasets(pattern=None):
-    """{label: store path} for whichever runs are on disk.
+    """{label: (u_store or None, v_store or None)} for whichever runs are on disk.
 
-    `coarse` holds only u (the slow wave), `fine` only v (the Kuramoto discs),
-    and the run whose summary says "both" holds u and v and is offered as `sum`.
+    A store holds `u` (the slow wave), `v` (the Kuramoto discs), or both, and its
+    summary.json says which.  The menu offers each part on its own, and one SUM
+    PER COARSE RESOLUTION -- "u 64 + v", "u 256 + v" -- because the generator
+    writes the coarse field at more than one and the whole question this page
+    asks is what the encoder does when the two scales are far apart.
 
-    THE RESOLUTION IS PART OF THE LABEL, because the generator now writes the
-    coarse field at more than one -- 64^2 and 256^2 in 2-D at the time of
-    writing -- and keying on the part alone silently kept whichever was newest.
-    So the menu reads "coarse u 64" and "coarse u 256" and offers both, and only
-    a genuine duplicate (same part, same resolution) collapses.
+    A sum is paired within one run when it can be: the both-run's own u and v.
+    Otherwise it pairs a standalone coarse run with the v of the both-run, which
+    is legitimate here and measured to be so -- the two v arrays are bit
+    identical (max |difference| 0.0), the fine field being deterministic given
+    the seed.  The coarse trajectories are NOT shared that way, so a mixed pair
+    is a different realisation of the same process and the page says so.
     """
-    out = {}
+    us, vs, both, out = {}, {}, {}, {}
     for d in sorted(glob.glob(pattern or ZARR_GLOB), key=os.path.getmtime):
         part, name = None, os.path.basename(os.path.dirname(d))
         # A store being written right now has a directory and no .zgroup yet.
@@ -117,11 +125,23 @@ def datasets(pattern=None):
             part = ("coarse" if "coarse" in name else
                     "fine" if "fine" in name else "both")
         if part == "both":
-            out["sum (u+v)"] = d
+            both[_grid_size(d, "u")] = d
+            us.setdefault(_grid_size(d, "u"), d)
+            vs.setdefault(_grid_size(d, "v"), d)
+        elif part == "coarse":
+            us[_grid_size(d, "u")] = d
         else:
-            n = _grid_size(d, "u" if part == "coarse" else "v")
-            out[f"{part} {'u' if part == 'coarse' else 'v'}"
-                + (f" {n}" if n else "")] = d
+            vs[_grid_size(d, "v")] = d
+
+    v_src = (next(iter(both.values()), None)
+             or (sorted(vs.items())[-1][1] if vs else None))
+    for n, d in sorted(us.items(), key=lambda kv: (kv[0] is None, kv[0])):
+        if v_src is not None:
+            # same-run pairing wherever the both-run's own u is this size
+            out[f"u {n} + v"] = (both.get(n, d), both.get(n, v_src))
+        out[f"coarse u {n}"] = (d, None)
+    for n, d in sorted(vs.items(), key=lambda kv: (kv[0] is None, kv[0])):
+        out[f"fine v {n}"] = (None, d)
     return out
 
 
@@ -145,47 +165,76 @@ PLAY: dict = {}
 
 
 def load_field(which, down, device, stores=None):
-    """(T, H, W) on the device, plus the frame count and the spatial size.
+    """(T, H, W) on the device, the frame count, the spatial size, the source.
 
-    The dataset toggle picks the STORE, and each store defines its own field:
-    `coarse` is u alone, `fine` is v alone, and `sum` is the run holding both,
-    with u carried up to v's grid and added.  NEAREST, not bilinear: the coarse
-    field is discrete at 256^2 and smoothing it on the way up would hand the fit
-    a target with structure the PDE never produced.  One coarse cell is a 4x4
-    block of fine cells, which is what the generator now writes as well.
+    NEAREST, not bilinear, when the coarse field is carried up to the fine grid:
+    it is discrete at its own resolution and smoothing it would hand the fit
+    structure the PDE never produced.  One coarse cell is one block of fine
+    cells, which is what the generator writes as well.
+
+    When a sum pairs two runs, their frame counts differ -- the coarse runs are
+    written at 401 frames against the fine 201 -- so the longer one is strided
+    to meet the shorter.  Both cover the same span; only the sampling differs.
     """
     stores = stores or DATASETS
-    path = stores.get(which)
-    if not path:
+    pair = stores.get(which)
+    if not pair:
         raise FileNotFoundError(
             f"no {which} dataset under {ZARR_GLOB} -- found "
             f"{sorted(stores) or 'nothing'}")
-    key = (path, which, down, str(device))
+    u_store, v_store = pair
+    key = (u_store, v_store, down, str(device))
     if key in DATA:
         return DATA[key]
     import zarr
-    g = zarr.open(path, mode="r")
-    have = set(g.group_keys())
 
-    def grid(k):
-        if k not in have:
-            raise KeyError(f"{os.path.basename(os.path.dirname(path))} has no "
-                           f"{k}/grid, only {sorted(have)}")
+    def grid(store, k):
+        g = zarr.open(store, mode="r")
+        if k not in set(g.group_keys()):
+            raise KeyError(f"{os.path.basename(os.path.dirname(store))} has no "
+                           f"{k}/grid")
         return torch.from_numpy(np.asarray(g[f"{k}/grid"][:, 0])).to(device)
 
-    part = which.split()[0]
-    if part == "coarse":
-        a = grid("u")
-    elif part == "fine":
-        a = grid("v")
-    else:
-        v = grid("v")
-        u = F.interpolate(grid("u")[:, None], size=v.shape[-2:],
-                          mode="nearest")[:, 0]
-        a = u + v
-    if down > 1:
-        a = F.avg_pool2d(a[:, None], down)[:, 0]
-    DATA[key] = (a.contiguous(), a.shape[0], a.shape[1], a.shape[2], path)
+    # STREAMED IN BLOCKS OF FRAMES, not read whole. The fine field is
+    # 201 x 1024^2 x 4 B = 843 MB at full resolution, and this page shares a GPU
+    # -- the first version of this asked for all of it at once and died with
+    # 632 MB free. Pooling each block as it lands means the peak is one block,
+    # and at downsample 2 the result is a quarter of the size.
+    def stream(chunk=16):
+        import zarr
+        gu = zarr.open(u_store, mode="r") if u_store else None
+        gv = zarr.open(v_store, mode="r") if v_store else None
+        nu = gu["u/grid"].shape[0] if gu is not None else None
+        nv = gv["v/grid"].shape[0] if gv is not None else None
+        step = 1
+        if nu and nv and nu != nv:              # 401 coarse frames against 201
+            step = max(1, round((nu - 1) / max(1, nv - 1)))
+        n = nv if nv is not None else nu
+        out = []
+        for i0 in range(0, n, chunk):
+            i1 = min(n, i0 + chunk)
+            if gv is None:
+                a = torch.from_numpy(
+                    np.asarray(gu["u/grid"][i0 * step:i1 * step:step, 0])).to(device)
+            elif gu is None:
+                a = torch.from_numpy(np.asarray(gv["v/grid"][i0:i1, 0])).to(device)
+            else:
+                v = torch.from_numpy(np.asarray(gv["v/grid"][i0:i1, 0])).to(device)
+                u = torch.from_numpy(
+                    np.asarray(gu["u/grid"][i0 * step:i1 * step:step, 0])).to(device)
+                u = u[:v.shape[0]]
+                a = F.interpolate(u[:, None], size=v.shape[-2:],
+                                  mode="nearest")[:, 0] + v[:u.shape[0]]
+                del u, v
+            if down > 1:
+                a = F.avg_pool2d(a[:, None], down)[:, 0]
+            out.append(a)
+        return torch.cat(out, 0)
+
+    a = stream()
+    src = " + ".join(sorted({os.path.basename(os.path.dirname(x))
+                             for x in (u_store, v_store) if x}))
+    DATA[key] = (a.contiguous(), a.shape[0], a.shape[1], a.shape[2], src)
     return DATA[key]
 
 
@@ -264,6 +313,69 @@ def band_map_at(model, h, w, t, device, sub=4):
     return {"png": cmap_png(eff.cpu().numpy(), N_BANDS - 1, "levels"),
             "mean": float(eff.mean()), "lo": float(eff.min()),
             "hi": float(eff.max()), "n_levels": N_BANDS}
+
+
+MONTAGE_LUT_MAX = 0.10           # what a band adds, signed, on a fixed scale
+
+
+@torch.no_grad()
+def band_montage(model, h, w, t, device, side=110, cols=4):
+    """The 16 frequency bands at one time slice, as one 4x4 picture.
+
+    The twin of the hash grid's level montage, and the same question: what does
+    each scale ADD.  Two differences, both measured rather than assumed.  Every
+    tile is rendered at the TILE resolution and not at its band's own Nyquist,
+    because the layers above the first manufacture harmonics -- 63-93% of a
+    tile's spectral energy sits above its band's own top frequency.  And the
+    first tile is the baseline the differences start from, which is not black:
+    with every unit gated off the first layer emits zeros and the rest of the
+    network returns a constant.
+    """
+    sub = max(1, int(round(max(h, w) / side)))
+    hs, ws = max(8, h // sub), max(8, w // sub)
+    c = frame_coords(hs, ws, t, device)
+    keep = model.unit_gain.clone()
+    cache = {}
+
+    def upto(k):
+        if k not in cache:
+            g = torch.zeros_like(model.unit_gain)
+            if k >= 0:
+                g[model.band_of(N_BANDS) <= k] = 1.0
+            model.set_unit_gain(g)
+            cache[k] = render(model, c, (hs, ws))
+        return cache[k]
+
+    bands = list(range(N_BANDS))[-(cols * cols - 1):]
+    tiles, labels = [], []
+    try:
+        b0 = bands[0] - 1
+        a = upto(b0)
+        rgb = (np.clip(a.cpu().numpy() / max(1e-6, float(a.abs().max())), -1, 1)
+               * 0.5 + 0.5)
+        tiles.append((matplotlib.colormaps["viridis"](rgb)[..., :3] * 255).astype(np.uint8))
+        labels.append(f"0..{b0}")
+        for b in bands:
+            d = upto(b) - upto(b - 1)
+            tiles.append(signed_rgb(d.cpu().numpy(), MONTAGE_LUT_MAX))
+            labels.append(f"B{b}")
+    finally:
+        model.set_unit_gain(keep)
+
+    th, tw, _ = tiles[0].shape
+    rows = (len(tiles) + cols - 1) // cols
+    sheet = np.zeros((rows * (th + 2) - 2, cols * (tw + 2) - 2, 3), np.uint8)
+    for i, tile in enumerate(tiles):
+        y, x = (i // cols) * (th + 2), (i % cols) * (tw + 2)
+        sheet[y:y + th, x:x + tw] = tile
+    im = Image.fromarray(sheet)
+    dr = ImageDraw.Draw(im)
+    for i, lab in enumerate(labels):
+        dr.text(((i % cols) * (tw + 2) + 2, (i // cols) * (th + 2) + 1), lab,
+                fill=(255, 255, 255))
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
 def train_job(p, device):
@@ -351,6 +463,8 @@ def train_job(p, device):
                         errs.append(float(d.pow(2).mean()))
                         lv[str(i)] = band_map_at(model, h, w,
                                                  fr / max(1, n_frames - 1), device)
+                    imgs["montage"] = band_montage(
+                        model, h, w, picks[1] / max(1, n_frames - 1), device)
                     # every frame, on a coarse grid: cheap, and the only way to
                     # see a fit that is good at the ends and lost in between
                     hs, ws = h // 4, w // 4
@@ -424,9 +538,9 @@ KNOBS = {
     ],
 }
 DEFAULTS = {k["name"]: k.get("default") for g in KNOBS.values() for k in g}
-DEFAULTS.update(field=next((k for k in DATASETS if k.startswith("sum")),
-                          next(iter(DATASETS), "sum (u+v)")),
-                downsample=2, coarse_to_fine=0, holdout=1)
+DEFAULTS.update(field=next((k for k in DATASETS if k.startswith("u ")),
+                          next(iter(DATASETS), "u 64 + v")),
+                downsample=1, coarse_to_fine=0, holdout=1)
 
 
 PAGE = r"""<!doctype html>
@@ -485,6 +599,9 @@ one gets given up.</p>
     <div class="cap">bands</div></div>
   <div class="panel"><canvas id="c_lev2" width="300" height="300"></canvas>
     <div class="cap">bands</div></div>
+  <div class="panel"><canvas id="c_montage" width="300" height="300"></canvas>
+    <div class="cap">what each band adds, middle frame &mdash; signed,
+      fixed &plusmn;__MONTMAX__</div></div>
 </div>
 <div id="levlegend" class="note"></div>
 <div class="row" style="margin-top:14px">
@@ -692,6 +809,7 @@ async function poll(){
       drawImg("c_err"+i, (r.images||{})["err"+i]);
       drawLevels("c_lev"+i, LASTLEV[String(i)], "c_target"+i);
     }
+    drawImg("c_montage", (r.images||{}).montage);
     drawCurve(r.curve); drawFrames(r.per_frame);
     document.getElementById("stats").innerHTML = m.psnr===undefined ? "press run"
       : `iteration <b>${r.step}</b> / ${r.steps} &nbsp;&middot;&nbsp; `
@@ -770,9 +888,10 @@ class Handler(BaseHTTPRequestHandler):
                         .replace("__DATASETS__",
                                  json.dumps(sorted(datasets(ZARR_GLOB),
                                                    key=lambda k:
-                                                   (not k.startswith("sum"), k))))
+                                                   (not k.startswith("u "), k))))
                         .replace("__LUTMAX__", str(LEVEL_LUT_MAX))
-                        .replace("__ERRMAX__", f"{ERROR_LUT_MAX:g}"))
+                        .replace("__ERRMAX__", f"{ERROR_LUT_MAX:g}")
+                        .replace("__MONTMAX__", f"{MONTAGE_LUT_MAX:g}"))
             return self._send(page, "text/html; charset=utf-8")
         if u.path == "/api/start":
             if JOB["running"]:
@@ -854,8 +973,8 @@ def main():
               flush=True)
     # "sum" even when nothing is on disk: the page rescans on every run, so the
     # selector has to hold a name until a store appears.
-    DEFAULTS["field"] = next((k for k in DATASETS if k.startswith("sum")),
-                             sorted(DATASETS)[0] if DATASETS else "sum (u+v)")
+    DEFAULTS["field"] = next((k for k in DATASETS if k.startswith("u ")),
+                             sorted(DATASETS)[0] if DATASETS else "u 64 + v")
     Handler.device = torch.device(a.device)
     try:
         srv = ThreadingHTTPServer(("0.0.0.0", a.port), Handler)
