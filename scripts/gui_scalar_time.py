@@ -60,6 +60,16 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ZARR_GLOB = "/workspace/Plexus/prototype/graphcast/log/*/field.zarr"
 
 
+def _grid_size(store, k):
+    """Cells along x for that field, from metadata alone: the label's suffix."""
+    meta = os.path.join(store, k, "grid", ".zarray")
+    try:
+        with open(meta) as f:
+            return json.load(f)["shape"][-1]
+    except (OSError, ValueError, KeyError, IndexError):
+        return None
+
+
 def _grid_rank(store):
     """Length of the first grid array's shape, from metadata alone -- no read."""
     for k in ("u", "v"):
@@ -74,11 +84,16 @@ def _grid_rank(store):
 
 
 def datasets(pattern=None):
-    """{'coarse'|'fine'|'sum': store path} for whichever runs are on disk.
+    """{label: store path} for whichever runs are on disk.
 
-    `coarse` holds only u (256^2, the slow wave), `fine` only v (1024^2, the
-    Kuramoto discs), and the run whose summary says "both" holds u and v and is
-    offered as `sum`.  Newest wins if a part was generated more than once.
+    `coarse` holds only u (the slow wave), `fine` only v (the Kuramoto discs),
+    and the run whose summary says "both" holds u and v and is offered as `sum`.
+
+    THE RESOLUTION IS PART OF THE LABEL, because the generator now writes the
+    coarse field at more than one -- 64^2 and 256^2 in 2-D at the time of
+    writing -- and keying on the part alone silently kept whichever was newest.
+    So the menu reads "coarse u 64" and "coarse u 256" and offers both, and only
+    a genuine duplicate (same part, same resolution) collapses.
     """
     out = {}
     for d in sorted(glob.glob(pattern or ZARR_GLOB), key=os.path.getmtime):
@@ -101,7 +116,12 @@ def datasets(pattern=None):
         if part is None:                       # no summary: fall back on the name
             part = ("coarse" if "coarse" in name else
                     "fine" if "fine" in name else "both")
-        out["sum" if part == "both" else part] = d
+        if part == "both":
+            out["sum (u+v)"] = d
+        else:
+            n = _grid_size(d, "u" if part == "coarse" else "v")
+            out[f"{part} {'u' if part == 'coarse' else 'v'}"
+                + (f" {n}" if n else "")] = d
     return out
 
 
@@ -153,9 +173,10 @@ def load_field(which, down, device, stores=None):
                            f"{k}/grid, only {sorted(have)}")
         return torch.from_numpy(np.asarray(g[f"{k}/grid"][:, 0])).to(device)
 
-    if which == "coarse":
+    part = which.split()[0]
+    if part == "coarse":
         a = grid("u")
-    elif which == "fine":
+    elif part == "fine":
         a = grid("v")
     else:
         v = grid("v")
@@ -403,7 +424,8 @@ KNOBS = {
     ],
 }
 DEFAULTS = {k["name"]: k.get("default") for g in KNOBS.values() for k in g}
-DEFAULTS.update(field="sum" if "sum" in DATASETS else next(iter(DATASETS), "sum"),
+DEFAULTS.update(field=next((k for k in DATASETS if k.startswith("sum")),
+                          next(iter(DATASETS), "sum (u+v)")),
                 downsample=2, coarse_to_fine=0, holdout=1)
 
 
@@ -492,9 +514,7 @@ function seg(title, opts, key){
     s.appendChild(b); });
   g.append(l,s); C.appendChild(g);
 }
-seg("dataset", DATASETS.map(k=>[
-      {sum:"sum (u+v)", coarse:"coarse wave u", fine:"fine kuramoto v"}[k], k]),
-    "field");
+seg("dataset", DATASETS.map(k=>[k, k]), "field");
 seg("downsample", [1,2,4], "downsample");
 seg("coarse to fine", [["off",0],["on",1]], "coarse_to_fine");
 seg("hold out every", [["none",1],["4th frame",4],["8th",8]], "holdout");
@@ -823,8 +843,8 @@ def main():
               flush=True)
     # "sum" even when nothing is on disk: the page rescans on every run, so the
     # selector has to hold a name until a store appears.
-    DEFAULTS["field"] = ("sum" if "sum" in DATASETS or not DATASETS
-                         else sorted(DATASETS)[0])
+    DEFAULTS["field"] = next((k for k in DATASETS if k.startswith("sum")),
+                             sorted(DATASETS)[0] if DATASETS else "sum (u+v)")
     Handler.device = torch.device(a.device)
     try:
         srv = ThreadingHTTPServer(("0.0.0.0", a.port), Handler)
