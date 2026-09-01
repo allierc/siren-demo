@@ -61,7 +61,16 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # once while this was written.  Each store carries a summary.json saying which
 # part it holds, which is what the dataset toggle is built from rather than the
 # directory name.
-ZARR_GLOB = "/workspace/Plexus/prototype/graphcast/log/*/field.zarr"
+# TWO PLACES, both by default: the toy generator's own output, and the real
+# datasets scripts/prepare_datasets.py writes into this repo. A page that only
+# looked at the first showed a menu of toys while the real cuts sat on disk
+# beside it, which is exactly what happened.
+ZARR_GLOB = ["/workspace/Plexus/prototype/graphcast/log/*/field.zarr",
+             os.path.join(ROOT, "data", "*", "field.zarr"),
+             # and the twin's, because scripts/prepare_datasets.py lives there
+             # and writes 154 MB that neither repo should hold twice
+             os.path.join(os.path.dirname(ROOT), "ngp-demo", "data", "*",
+                          "field.zarr")]
 
 
 def _grid_size(store, k):
@@ -104,7 +113,11 @@ def datasets(pattern=None):
     is a different realisation of the same process and the page says so.
     """
     us, vs, both, out = {}, {}, {}, {}
-    for d in sorted(glob.glob(pattern or ZARR_GLOB), key=os.path.getmtime):
+    pats = pattern or ZARR_GLOB
+    pats = [pats] if isinstance(pats, str) else list(pats)
+    found = sorted({d for pat in pats for d in glob.glob(pat)},
+                   key=os.path.getmtime)
+    for d in found:
         part, name = None, os.path.basename(os.path.dirname(d))
         # A store being written right now has a directory and no .zgroup yet.
         # Skipping it beats crashing on it: the generator is often running.
@@ -1040,11 +1053,14 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", type=int, default=8125)
-    ap.add_argument("--zarr-glob", default=ZARR_GLOB,
-                    help="where to look for the toy2d runs")
+    ap.add_argument("--zarr-glob", default=None, action="append",
+                    help="where to look for stores; repeatable, and replaces "
+                         "the two defaults (the toy generator's log and this "
+                         "repo's data/)")
     ap.add_argument("--device",
                     default="cuda:0" if torch.cuda.is_available() else "cpu")
     a = ap.parse_args()
+    a.zarr_glob = a.zarr_glob or ZARR_GLOB
     globals()["ZARR_GLOB"] = a.zarr_glob
     DATASETS.clear()
     DATASETS.update(datasets(a.zarr_glob))
@@ -1053,9 +1069,11 @@ def main():
     # twice in one afternoon -- so the page comes up either way and rescans on
     # every run, and pressing run once the store lands is enough.
     if not DATASETS:
-        near = sorted(os.path.basename(os.path.dirname(d))
-                      for d in glob.glob(os.path.dirname(
-                          os.path.dirname(a.zarr_glob)) + "/*"))
+        pats = ([a.zarr_glob] if isinstance(a.zarr_glob, str) else a.zarr_glob)
+        near = sorted({os.path.basename(os.path.dirname(d))
+                       for pat in pats
+                       for d in glob.glob(os.path.dirname(
+                           os.path.dirname(pat)) + "/*")})
         print(f"no store under {a.zarr_glob} yet -- the page will rescan on "
               f"every run. Beside it: {', '.join(near[:8]) or 'nothing'}",
               flush=True)
