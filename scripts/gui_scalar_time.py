@@ -351,11 +351,15 @@ def band_map_at(model, h, w, t, device, sub=4):
             "hi": float(eff.max()), "n_levels": N_BANDS}
 
 
-MONTAGE_LUT_MAX = 0.10           # what a band adds, signed, on a fixed scale
+# What a band adds, signed. NOT a constant: these datasets run from a +-1 wave to
+# raw counts in the hundreds, and a fixed +-0.1 saturates every tile of the
+# second into one flat red. Set per run from the shown range, like the error
+# panel, and reported in the caption.
+MONTAGE_LUT_FRAC = 0.05
 
 
 @torch.no_grad()
-def band_montage(model, h, w, t, device, side=110, cols=4):
+def band_montage(model, h, w, t, device, vmax, side=110, cols=4):
     """The 16 frequency bands at one time slice, as one 4x4 picture.
 
     The twin of the hash grid's level montage, and the same question: what does
@@ -383,7 +387,7 @@ def band_montage(model, h, w, t, device, side=110, cols=4):
         return cache[k]
 
     bands = list(range(N_BANDS))[-(cols * cols - 1):]
-    tiles, labels = [], []
+    tiles, labels, raw = [], [], []
     try:
         b0 = bands[0] - 1
         a = upto(b0)
@@ -393,16 +397,16 @@ def band_montage(model, h, w, t, device, side=110, cols=4):
         labels.append(f"0..{b0}")
         for b in bands:
             d = upto(b) - upto(b - 1)
-            tiles.append(signed_rgb(d.cpu().numpy(), MONTAGE_LUT_MAX))
+            tiles.append(signed_rgb(d.cpu().numpy(), vmax))
             labels.append(f"B{b}")
     finally:
         model.set_unit_gain(keep)
 
-    return _sheet(tiles, labels, cols)
+    return _sheet(*_scale(tiles, labels, raw, vmax, size=(hs, ws)), cols)
 
 
 @torch.no_grad()
-def band_kymograph(model, h, w, n_frames, device, side=110, cols=4):
+def band_kymograph(model, h, w, n_frames, device, vmax, side=110, cols=4):
     """The temporal pendant of the band montage: what each band adds, in TIME.
 
     One horizontal line through the field swept over every frame, so each tile
@@ -431,7 +435,7 @@ def band_kymograph(model, h, w, n_frames, device, side=110, cols=4):
         return cache[k]
 
     bands = list(range(N_BANDS))[-(cols * cols - 1):]
-    tiles, labels = [], []
+    tiles, labels, raw = [], [], []
     try:
         b0 = bands[0] - 1
         a = upto(b0)
@@ -440,11 +444,34 @@ def band_kymograph(model, h, w, n_frames, device, side=110, cols=4):
         labels.append(f"0..{b0}")
         for b in bands:
             d = upto(b) - upto(b - 1)
-            tiles.append(signed_rgb(d.cpu().numpy(), MONTAGE_LUT_MAX))
+            tiles.append(signed_rgb(d.cpu().numpy(), vmax))
             labels.append(f"B{b}")
     finally:
         model.set_unit_gain(keep)
-    return _sheet(tiles, labels, cols)
+    return _sheet(*_scale(tiles, labels, raw, vmax), cols)
+
+
+def _scale(tiles, labels, raw, hint, size=None):
+    """Colour the difference tiles on a scale taken from the differences.
+
+    A fraction of the FIELD's range is the wrong scale for them: on the zapbench
+    plane the field runs to 1235 counts and a level's contribution to hundreds,
+    so 5% of the field saturated every tile into one flat red.  The 99th
+    percentile of |difference| over the whole sheet puts the scale where the
+    differences actually are, and it is written onto the first tile so the sheet
+    carries its own units.
+    """
+    if raw:
+        allv = np.concatenate([d.ravel() for _, d in raw])
+        vmax = float(np.percentile(np.abs(allv), 99)) or abs(hint) or 1e-3
+        for i, d in raw:
+            rgb = signed_rgb(d, vmax)
+            if size is not None and rgb.shape[:2] != tuple(size):
+                rgb = np.asarray(Image.fromarray(rgb).resize(
+                    (size[1], size[0]), Image.NEAREST))
+            tiles[i] = rgb
+        labels[0] = f"{labels[0]}  +-{vmax:.3g}"
+    return tiles, labels
 
 
 def _sheet(tiles, labels, cols=4, gap=2):
@@ -561,8 +588,10 @@ def train_job(p, device):
                         lv[str(i)] = band_map_at(model, h, w,
                                                  fr / max(1, n_frames - 1), device)
                     imgs["montage"] = band_montage(
-                        model, h, w, picks[1] / max(1, n_frames - 1), device)
-                    imgs["kymo"] = band_kymograph(model, h, w, n_frames, device)
+                        model, h, w, picks[1] / max(1, n_frames - 1), device,
+                        err_max)
+                    imgs["kymo"] = band_kymograph(model, h, w, n_frames,
+                                                   device, err_max)
                     # every frame, on a coarse grid: cheap, and the only way to
                     # see a fit that is good at the ends and lost in between
                     hs, ws = h // 4, w // 4
@@ -708,7 +737,7 @@ one gets given up.</p>
 <div class="row grid3" style="margin-top:8px">
   <div class="panel"><canvas id="c_montage" width="300" height="300"></canvas>
     <div class="cap">what each band adds in SPACE, middle frame &mdash; signed,
-      fixed &plusmn;__MONTMAX__</div></div>
+      fixed at 5% of the shown range</div></div>
   <div class="panel"><canvas id="c_kymo" width="300" height="300"></canvas>
     <div class="cap">what each band adds in TIME &mdash; x across, t down,
       through the middle row</div></div>
@@ -1002,7 +1031,7 @@ class Handler(BaseHTTPRequestHandler):
                                                    (not k.startswith("u "), k))))
                         .replace("__LUTMAX__", str(LEVEL_LUT_MAX))
                         .replace("__ERRMAX__", f"{ERROR_LUT_MAX:g}")
-                        .replace("__MONTMAX__", f"{MONTAGE_LUT_MAX:g}"))
+)
             return self._send(page, "text/html; charset=utf-8")
         if u.path == "/api/start":
             if JOB["running"]:
